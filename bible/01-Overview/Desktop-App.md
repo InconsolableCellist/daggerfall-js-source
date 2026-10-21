@@ -376,7 +376,7 @@ here: a game launched from Steam's own library on SteamOS gets Steam's
 `LD_PRELOAD` (its overlay library) and `LD_LIBRARY_PATH`, under which
 Electron's browser process started its zygote and waited for ever; a
 wrapper that unsets both before starting the AppImage runs it. Pinned in
-`test/rel4_release.test.js`.
+`test/tooling/rel4_release.test.js`.
 
 ## Updating (DA6)
 
