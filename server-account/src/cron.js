@@ -18,12 +18,18 @@
 //   and the day's Motherlodes (motherlodes.js motherlodesOf). EVERY ONE OF THEM STILL RUNS ON ITS READ TOO, exactly as before - a read must never answer from a
 //   world the clock has not caught up with - but the clock has nearly always been first, so the read's own pass finds
 //   nothing due and writes nothing. Each was written for a race (two readers at once), so the clock is one more racer.
+//   REZ-BLOODLINE AUDIT R1 (2026-10-16): and the falls held for a party's Resurrect whose window closed with no tab to
+//   close it (legacy.js settleHolds) - the one with no read of its own: the tab that fell closes its own (realmDie),
+//   and a tab killed under its death screen has nobody else to.
 //
 //   EVERY HOUR (CRON_HOUR) - the sweeps the reads no longer run (the board's, the guild boards', the harvests', the
 //   market's history, each its module's own law, exported beside its table) and the retention the tables never had:
 //   a rate window a day past its start (RATE_ROW_KEEP_S - the longest window any bucket counts is an hour), a session
 //   idle past SESSION_IDLE_S (the very bound resolveSession refuses it at), an invitation past GUILD_INVITE_TTL_S
 //   (the bound every read of one asks).
+//   EG-ZM (bible/11-Multiplayer/Elite-Gates.md section 23, "The clock"): and the one settlement no read makes - a Weir
+//   Key's stake no receipt ever settled, spent once nothing can name it (eg.js spendLapsedStakes, EG_STAKE_CLOCK_S past its
+//   end) and its opener told in the mailbox.
 //
 // WHAT IS NOT PRUNED, AND WHY (the audit asked; read against the code, SCALE4b's record):
 //   - the act receipts (prof_withdrawals, prof_choices, guild_store_moves and their kind): a client keeps an
@@ -46,31 +52,38 @@ import { closeAuctions, pruneMarketHistory, SETTLE_MAX, reckonPatrons, marketOpe
 import { closeGuildWrits } from './writs.js';
 import { closeContracts } from './contracts.js';
 import { settleDueOnce } from './seatTurning.js';
+import { keepSeatFacts } from './townSeats.js';   // SEAT-FACTS: the seats' facts, kept once for the service
 import { motherlodesOf } from './motherlodes.js';
 import { sweepBoard } from './board.js';
+import { safetyMinute, safetySweep } from './safetyClock.js';   // SAFE5 + SAFE8: the reviewer's reads and the moderators' cards; the hour's sweep
 import { sweepGuildNotes } from './guildBoard.js';
 import { sweepHarvests } from './professions.js';
 import { SESSION_IDLE_S } from './accounts.js';
 import { storeArenaChampion, ARENA_CHAMPION_CLOCK_S } from './arena.js';
 import { iliacChampionClock } from './iliac.js';   // CARDS10: Iliac Hand's season #1, counted the arena's way
+import { gambitChampionClock } from './gambit.js';   // KG6: The King's Gambit's season #1, the same way
 import { countedDb } from './metrics.js';
 import { maintaining } from './service.js';
 import { WRIT_SETTLE_MAX } from '../../src/net/writLaw.js';
 import { seatsSwitchOf, seasonZeroOf } from '../../src/net/townSeatLaw.js';
 import { profSwitchOf } from '../../src/net/professionLaw.js';
-import { GUILD_INVITE_TTL_S } from '../../src/net/guildLaw.js';
+import { GUILD_INVITE_TTL_S } from '../../src/net/guild/guildLaw.js';
 import { utcDay } from '../../src/net/marksLaw.js';
-import { arenaSeasonOf } from '../../src/net/arenaLaw.js';
+import { arenaSeasonOf } from '../../src/net/arena/arenaLaw.js';
 import { REALM_FINDINGS_KEEP_S, REALM_WEALTH_KEEP_S } from './review.js';   // INT2/INT5: the judge's record's keeping
 import { WILD_FALLS_KEEP_S } from './wild.js';   // INT9: a death's drop's keeping
+import { settleHolds, REZ_SETTLE_MAX } from './legacy.js';   // REZ-BLOODLINE AUDIT R1: a held fall's window closed
+import { spendLapsedStakes } from './eg.js';   // EG-ZM: the Weir Key's stake's clock
+import { TOWN_ECON_SWEEPS, TOWN_ECON_SEEN_SWEEP, townEconKeptFrom, townEconSeenFrom, keepTownShares, townsOpen } from './townEcon.js';   // TOWN-ECON TE2: a town's acts past the days kept; AUDIT TOWN-ECON 2 SVC-3: the shares kept once
+import { settleStaleYards } from './decor.js';   // YARD-SNAP: a town's yards built again where a write left them stale
 
-/** The two schedules - wrangler.toml's [triggers] crons name exactly these (test/scale4b.test.js holds the two to
+/** The two schedules - wrangler.toml's [triggers] crons name exactly these (test/server/scale4b.test.js holds the two to
  *  each other). The hour's minute is off the hour, where every other Worker's cron lands. */
 export const CRON_MINUTE = '* * * * *';
 export const CRON_HOUR = '41 * * * *';
 
 /** A rate window's row is dead once its window has closed; the longest window any bucket counts is an hour
- *  (accounts.js overRate's callers - test/scale4b.test.js sweeps every one), so a day past its start is two dozen
+ *  (accounts.js overRate's callers - test/server/scale4b.test.js sweeps every one), so a day past its start is two dozen
  *  windows dead. */
 export const RATE_ROW_KEEP_S = 24 * 3600;
 /** Rows one sweep's statement takes at once, and how many times a job asks again while it took a full page - a firing
@@ -117,6 +130,16 @@ export const MINUTE_JOBS = Object.freeze([
   ['contracts', (ctx) => rounds(() => closeContracts(ctx), WRIT_SETTLE_MAX, ctx.budget)],
   // a seat's Turning while the seats are open to everyone - behind `dev` they are a developer's, settled by their reads
   ['seats', async (ctx, env) => (seatsSwitchOf(env?.SEATS_OPEN) === 'on' ? (await settleDueOnce(ctx.db, ctx.nowS, seasonZeroOf(env.SEASON_ZERO_WEEK))).settled : 0)],
+  // SEAT-FACTS (townSeats.js keepSeatFacts): the seats' facts counted once for the whole service while the seats are open
+  // to anyone (`dev` too: a developer's player reads them) - one read of the rows and one row kept, where every isolate
+  // read the rows each minute
+  ['seat-facts', async (ctx, env) => (seatsSwitchOf(env?.SEATS_OPEN) === 'off' ? 0 : keepSeatFacts(ctx.db, ctx.nowS))],
+  // AUDIT TOWN-ECON 2 SVC-3 (townEcon.js keepTownShares): the towns' shares counted once for the whole service each keeping,
+  // into the one row every isolate reads - where every isolate read every town's days on the primary
+  ['town-shares', async (ctx, env) => (townsOpen(env) ? keepTownShares(ctx.db, ctx.nowS) : 0)],
+  // YARD-SNAP (decor.js settleStaleYards): a town's yards built again where a write no decor route made left them stale -
+  // a home released, an account gone, a sweep; until then the town's yards are read from its rows, as before
+  ['yard-snap', (ctx) => settleStaleYards(ctx.db)],
   // the season's #1, counted before a reader would count it (arena.js championNow, STORM-SHED 2's kept word). AUDIT SCALE
   // A4: COUNTED ONLY WHEN A BOUT HAS COME SINCE - the board moves through a bout alone (claimArena counts it at once; no
   // route deletes an account), so a kept word no bout is newer than is stamped again rather than counted: the count
@@ -137,6 +160,15 @@ export const MINUTE_JOBS = Object.freeze([
   }],
   // CARDS10: Iliac Hand's season #1, the arena's law (iliac.js iliacChampionClock) - counted only after a rated game
   ['iliac-champion', async (ctx) => iliacChampionClock(ctx)],
+  // KG6: The King's Gambit's season #1 - its GRANDMASTER (gambit.js gambitChampionClock), Iliac Hand's law
+  ['gambit-champion', async (ctx) => gambitChampionClock(ctx)],
+  // REZ-BLOODLINE AUDIT R1 (legacy.js settleHolds): a fall the death door held for a party's Resurrect whose window closed
+  // with no tab to close it - a page killed under its death screen - takes what a tombstone takes with it (its union, its
+  // guild seat, its pieces). The window is the realm's own (REZ_HOLD_S), so the minute is the read that catches it
+  ['rez-holds', (ctx) => rounds(() => settleHolds(ctx), REZ_SETTLE_MAX, ctx.budget)],
+  // SAFE5 + SAFE8 (bible/11-Multiplayer/Chat-Safety-Arc.md): the reviewer reads the relay's feed and the reported cases,
+  // and each case's card goes to the moderators' channel - nothing a request waits on (safetyClock.js)
+  ['safety', (ctx, env) => safetyMinute(ctx, env)],
   ['motherlodes', async (ctx, env) => {
     const day = utcDay(ctx.nowS);
     if (profSwitchOf(env?.PROFESSIONS_OPEN) !== 'on' || lodesPicked === day) return 0;
@@ -161,6 +193,13 @@ export const HOUR_JOBS = Object.freeze([
     }
     return n;
   }],
+  // TOWN-ECON TE2 (townEcon.js): a town's days, its accounts' acts and the ticks seen, past the days the share weighs
+  ['town-econ', async (ctx) => {
+    let n = 0;
+    for (const sql of TOWN_ECON_SWEEPS) n += await rounds(() => deleted(ctx.db, sql, townEconKeptFrom(ctx.nowS)), SWEEP_ROWS, ctx.budget);
+    n += await rounds(() => deleted(ctx.db, TOWN_ECON_SEEN_SWEEP, townEconSeenFrom(ctx.nowS)), SWEEP_ROWS, ctx.budget);   // AUDIT TOWN-ECON 2 SVC-5: a receipt's life
+    return n;
+  }],
   ['rate-limits', (ctx) => rounds(() => deleted(ctx.db,
     'DELETE FROM rate_limits WHERE rowid IN (SELECT rowid FROM rate_limits WHERE window_start < ?1 LIMIT ?2)', ctx.nowS - RATE_ROW_KEEP_S), SWEEP_ROWS)],
   // resolveSession's own bound: idle when nowS - last_seen > SESSION_IDLE_S. AUDIT SCALE A6: the table walked, by no index of
@@ -176,15 +215,28 @@ export const HOUR_JOBS = Object.freeze([
     'DELETE FROM realm_findings WHERE id IN (SELECT id FROM realm_findings WHERE at < ?1 LIMIT ?2)', ctx.nowS - REALM_FINDINGS_KEEP_S), SWEEP_ROWS)],
   ['realm-wealth-hours', (ctx) => rounds(() => deleted(ctx.db,
     'DELETE FROM realm_wealth_hours WHERE rowid IN (SELECT rowid FROM realm_wealth_hours WHERE hour < ?1 LIMIT ?2)', ctx.nowS - REALM_WEALTH_KEEP_S), SWEEP_ROWS)],
+  // INT17: the progression claims' hours, kept as the wealth's are - the window staff set the line from (progress.js)
+  ['progress-hours', (ctx) => rounds(() => deleted(ctx.db,
+    'DELETE FROM progress_hours WHERE rowid IN (SELECT rowid FROM progress_hours WHERE hour < ?1 LIMIT ?2)', ctx.nowS - REALM_WEALTH_KEEP_S), SWEEP_ROWS)],
   // INT9: a death in the zone's drop, kept past its receipt's hour (wild.js - a second asking is answered the first's)
   ['wild-falls', (ctx) => rounds(() => deleted(ctx.db,
     'DELETE FROM wild_falls WHERE r IN (SELECT r FROM wild_falls WHERE at < ?1 LIMIT ?2)', ctx.nowS - WILD_FALLS_KEEP_S), SWEEP_ROWS)],
+  // MAC (2026-10-14, the two-phase handoff): an escrow ENDED (collected, or back with its fallen) kept as long as a fall is -
+  // a held one never: its piece is in no record but it
+  ['wild-escrow', (ctx) => rounds(() => deleted(ctx.db,
+    "DELETE FROM wild_escrow WHERE r IN (SELECT r FROM wild_escrow WHERE state != 'held' AND ended_at < ?1 LIMIT ?2)", ctx.nowS - WILD_FALLS_KEEP_S), SWEEP_ROWS)],
   // LW15 (bible/06-Systems/Living-World-II.md): the towns' patrons at their traders, the towns waiting (a read reckons its
   // own). AUDIT LW-II P8: while the market is open to everyone (market.js marketOpenFor, no account's - every switch
   // `on`); shut, its every route answers 'market-closed', and the clock paid patrons' gold anyway. AUDIT LW-II-2 S3: and
   // while it is not, every trader's hours are marked as they pass (markPatronsShut), so opening it pays none of them -
   // behind `dev` too: no read reckons then (reckonPatrons asks the switch itself)
   ['patrons', async (ctx, env) => (marketOpenFor(null, env) ? (await reckonPatrons(ctx, {}, env)).sold : markPatronsShut(ctx))],
+  // EG-ZM (bible/11-Multiplayer/Elite-Gates.md section 23): a Weir Key's stake no receipt settled, spent by the clock once
+  // nothing can name it, its opener's letter in the same transaction - a page a statement pair, asked again while full
+  ['eg-stakes', (ctx) => rounds(() => spendLapsedStakes(ctx.db, ctx.nowS, SWEEP_ROWS), SWEEP_ROWS, ctx.budget)],
+  // SAFE5 (safetyClock.js): the feed's old batches, a resolved case's lines past their keeping, a case left open past its
+  // own, and the reviewer's old daily counts
+  ['safety-sweep', (ctx) => safetySweep(ctx)],
 ]);
 
 /** The jobs a schedule runs - none for a schedule this service does not keep (said, so a trigger renamed in

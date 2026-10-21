@@ -2,7 +2,7 @@
 // CAPT-BOARD (2026-10-11, the owner: "giving a reason to players to experience it"; bible/03-World/Captains-Sea.md
 // CAPT-BOARD) - THE HARBOUR OFFICE: the harbourmaster's board, the contracts a captain holds, and the crown's favours a
 // captain's rank buys, stood over the captain's ledger (systems/naval/captainLedger.js) for the world host. The yard's
-// window draws it as its Harbourmaster tab (ui/navalYardWindow.js); the naval host tells it what happened at sea
+// window draws it as its Harbourmaster tab (ui/naval/navalYardWindow.js); the naval host tells it what happened at sea
 // (`event`) and asks it where the held contracts' waters are (`sites`); the world steps its clock (`tick`).
 //
 // deps = {
@@ -14,54 +14,93 @@
 //   say(text, s) / mid(text, s)  the HUD's line and the screen's middle
 //   notorietyOf(crown)         a crown's notoriety against the captain in its waters (navalHost.js)
 //   port() -> port | null      the port the captain lies at: { key, name, px, py, region, crown }
-//   ports() -> port[]          every port of the map
-//   seaAt(px, py) -> bool      a map pixel of open sea
+//   ports() -> port[]          every port of the map (its towns - FIELD BUGS 2026-10-13c PORT-TOWNS)
+//   seaAt(px, py) -> bool      a map pixel of open sea (a site's water; the sea beside a port a cargo goes to)
 //   waters() -> crown | null   the crown of the waters the captain sails
 //   carrack(price, port) -> bool  the Admiralty's carrack's title to the Fleet's book (systems/fleet.js titleDeed)
 //   stow(hold, item)           an item into a ship's hold (CAPT-TRADE)
-//   etherGoods() -> bool       whether the captain may sail for the Etheric Sea's goods (AUDIT CAPTAIN'S SEA B16)
+//   etherGoods() -> bool       whether the captain may sail for the Eltheric Ocean's goods (AUDIT CAPTAIN'S SEA B16)
+//   town                       SEA-TRADE: the town economy (scenes/townEconHost.js) - `exchangeAt(port)` the port town's
+//                              exchange factors (null offline, or no town economy), `seaDeal(port)` a dealing made there
 // }
 //
 // CAPT-TRADE: THE EXCHANGE (systems/naval/tradeGoods.js) - the port's goods at the day's prices, bought into the hold of
 // the boat at the quay and sold out of it, as much as the exchange deals in today (the ledger keeps the day's dealing).
+// SEA-TRADE (bible/06-Systems/Town-Economy-Arc.md section 8): online, at its port town's economy's prices, every
+// dealing told to the town economy (a sea act of the players' share), and a good bought carrying what it cost and the
+// counter's mark (tradeModes.js markCounterBought: LAW-3; AUDIT LW-II-2 S1 - no patron takes it, as no shop buys it, B2).
 //
 // CAPT-CHARTS: TREASURE CHARTS (systems/naval/treasureCharts.js) - one among a pirate's papers (`chartFor`), read and
 // marked (`readChart`), its cache a site of the naval host's, raised and paid (`raiseCache`).
 
-import { boardFor, takeContract, contractLine, contractSites, marqueOffer, admiraltyOffer, CONTRACTS_MAX, STANDING_ABANDONED } from '../systems/naval/harbourBoard.js';
+import { boardFor, takeContract, contractLine, contractSites, marqueOffer, admiraltyOffer, deliveryPort, CONTRACTS_MAX, STANDING_ABANDONED } from '../systems/naval/harbourBoard.js';
 import { MINUTES_PER_DAY } from '../systems/gameDate.js';
-import { perksOf, PERKS_REFUSED_AT } from '../systems/naval/captainLedger.js';
+import { perksOf, PERKS_REFUSED_AT, LEAGUE_M } from '../systems/naval/captainLedger.js';
 import { exchangeOf, goodById, goodIn, takeGood, mintGood, goodsWeight } from '../systems/naval/tradeGoods.js';
+import { markCounterBought } from '../systems/tradeModes.js';   // SEA-TRADE: a good bought of the exchange carries what it cost (LAW-3)
 import { chartAboard, chartSite, mintChart, cacheGold, CHART_SITE } from '../systems/naval/treasureCharts.js';
+import { t } from '../systems/textManager.js';   // FIELD BUGS 2026-10-13c PORT-TOWNS: a cargo voided, in the player's language
+import { noteAct } from '../systems/questlines/qlActs.js';   // QL11: the features' acts, heard by the running quests
 
 const gold = (n) => `${Math.round(n).toLocaleString('en-US')} gold`;
 const days = (n) => `${n} ${n === 1 ? 'day' : 'days'}`;
+/** FIELD BUGS 2026-10-13c PORT-TOWNS: a cargo voided - held for a place that is no port a cargo goes to (`unported`). */
+const cargoVoidWords = (c) => t('sea.board.cargoVoid', 'Contract void - {title}. No ship can make port there.', { title: c.title });
 /** A held contract's progress, as the HUD says it when it moves. */
 const movedWords = (c) => (c.kind === 'hunt' ? `${c.done} of ${c.need} pirate ships ended` : c.kind === 'survey' ? `${c.done} of ${c.need} ships studied`
   : c.kind === 'salvage' ? `${c.done} of ${c.need} casks raised` : '');
 
+/** QL11: A PORT REACHED UNDER SAIL - a berth (the naval host's: her way off at a port's quay, said every second she lies
+ *  there) at another port than the last one heard, with at least this much way made at the helm since it (m, the
+ *  captain's log's own count): a quarter league. A ship lying at a quay berths every second and so makes none between
+ *  two, and one drifting where two ports' waters meet never makes this much. The first berth of a session, and the first
+ *  after a load (the ledger's restore lays a new log), only marks where she lies. */
+export const PORT_VOYAGE_M = LEAGUE_M / 4;
+
 /** @param {any} deps */
 export function createHarbourOffice(deps) {
-  const L = deps.ledger;
+  const L = deps.ledger;   // CAPTAIN-TREE: and her stars - `trade` the exchange's spread her dealing closes (tradeGoods.js exchangeOf)
   const now = () => Math.floor(Number(deps.now?.()) || 0);
   /** A crown's favours for the captain now - none while its navy hunts them. */
   const perksAt = (crown) => (crown ? perksOf(L.rank(crown).rank, deps.notorietyOf?.(crown) ?? 0) : perksOf(0));
   /** The port the captain lies at, or null. */
   const portHere = () => deps.port?.() ?? null;
+  /** SEA-TRADE: the port town's exchange factors, or null (offline, an isle, no town economy). */
+  const townAt = (port) => deps.town?.exchangeAt?.(port) ?? null;
 
+  /** QL11: the last berth heard - its port, the log it was counted in and its way then - or null before the first
+   *  (PORT_VOYAGE_M). */
+  let berth = null;
   /** What happened at sea, to the contracts held: each done paid and said, each failed said, each come further said. */
   function event(ev) {
+    if (ev?.type === 'berth' && typeof ev.port === 'string') {
+      const log = L.log ?? null, sailed = Number(log?.sailed) || 0;
+      if (berth && berth.log === log && berth.port !== ev.port && sailed - berth.sailed >= PORT_VOYAGE_M) noteAct('port-reached');   // QL11: a port reached under sail
+      berth = { port: ev.port, log, sailed };
+    }
     const r = L.contractEvent(ev);
-    for (const c of r.done) { deps.credit?.(c.pay); deps.mid?.(`Contract done - ${c.title}. ${gold(c.pay)} paid by ${c.port?.name ?? c.crown}'s harbourmaster.`, 5); }
-    for (const c of r.failed) deps.mid?.(`Contract failed - ${c.title}.${c.kind === 'delivery' ? ' The cargo went down with her.' : ''}`, 5);
+    for (const c of r.done) { deps.credit?.(c.pay); deps.mid?.(`Contract done - ${c.title}. ${gold(c.pay)} paid by ${c.port?.name ?? c.crown}'s harbormaster.`, 5); }
+    for (const c of r.done) if (c.kind === 'delivery') noteAct('cargo-delivered');   // QL11: a cargo delivered - its port's harbormaster paid it
+    for (const c of r.failed) deps.mid?.(`Contract failed - ${c.title}.${c.kind === 'delivery' ? ' The cargo went down with the ship.' : ''}`, 5);
     for (const c of r.moved) deps.say?.(`${c.title}: ${movedWords(c)}.`, 3);
-    for (const c of r.voided ?? []) deps.mid?.(`Bounty void - ${c.title}. She went down by another hand.`, 5);   // AUDIT CAPTAIN'S SEA B4
+    for (const c of r.voided ?? []) deps.mid?.(c.kind === 'delivery' ? cargoVoidWords(c) : `Bounty void - ${c.title}. Someone else sank it.`, 5);   // AUDIT CAPTAIN'S SEA B4; FIELD BUGS 2026-10-13c PORT-TOWNS
     return r;
   }
-  /** The clock's step: every contract whose term is out failed, and said. */
+  /** The clock's step: every contract whose term is out failed, and said. FIELD BUGS 2026-10-13c PORT-TOWNS: and every
+   *  cargo held for a place that is no port a cargo goes to - none of the map's ports (`deps.ports`, its towns), or one
+   *  with no sea beside it (harbourBoard.js deliveryPort) - void, no regard lost, and said: a board that read Travel
+   *  Options' every place a ship may put in at as a port posted cargoes to tombs, farms and inland capitals, which no
+   *  ship can lie at. Asked once the map's ports and the sea stand. */
   function tick() {
     const failed = L.expireContracts(now());
     for (const c of failed) deps.mid?.(`Contract failed - ${c.title}. Its term ran out.`, 5);
+    const ports = deps.ports?.() ?? [];
+    if (ports.length && typeof deps.seaAt === 'function') {
+      for (const c of L.contracts()) {
+        if (c.kind !== 'delivery' || (ports.some((p) => p.key === c.to?.key) && deliveryPort(c.to, deps.seaAt))) continue;
+        event({ type: 'unported', port: c.to?.key });
+      }
+    }
     return failed;
   }
   /** The board of the port the captain lies at, today - its offers not yet taken. */
@@ -76,7 +115,7 @@ export function createHarbourOffice(deps) {
     if (L.contracts().length >= CONTRACTS_MAX) return { ok: false, text: `You hold ${CONTRACTS_MAX} contracts already.` };
     if (o.kind === 'delivery' && boat?.uid == null) return { ok: false, text: 'A cargo needs a ship of your own to carry it.' };
     const c = takeContract(o, { now: now(), boat: o.kind === 'delivery' ? boat.uid : null });
-    if (!L.holdContract(c)) return { ok: false, text: 'The harbourmaster will not give it to you.' };
+    if (!L.holdContract(c)) return { ok: false, text: 'The harbormaster will not give it to you.' };
     return { ok: true, text: o.kind === 'delivery' ? `The cargo is stowed in your hold. ${days(o.days)} to ${o.to.name}.` : `Taken: ${o.title}. ${days(o.days)}.` };
   }
   /** A held contract given up. */
@@ -92,7 +131,7 @@ export function createHarbourOffice(deps) {
     if (!o.can) return { ok: false, text: o.why };
     deps.pay?.(o.price);
     L.setMarque(port.crown, now() + o.days * MINUTES_PER_DAY);
-    return { ok: true, text: `${port.crown}'s letter of marque is yours for ${days(o.days)}: its rivals' ships are your prizes in ${port.crown}'s eyes - their own crowns still call it piracy.` };   // AUDIT CAPTAIN'S SEA L14
+    return { ok: true, text: `${port.crown}'s letter of marque is yours for ${days(o.days)}. ${port.crown} counts its rivals' ships as fair prizes, but their own crowns still call it piracy.` };   // AUDIT CAPTAIN'S SEA L14
   }
   /** The Admiralty's carrack bought of this port's crown - her title to the Fleet's book. */
   function buyCarrack() {
@@ -102,11 +141,11 @@ export function createHarbourOffice(deps) {
     if (!o.can) return { ok: false, text: o.why };
     if (!deps.carrack?.(o.price, port)) return { ok: false, text: 'The Admiralty\'s yard has no carrack to give today.' };
     deps.pay?.(o.price);
-    return { ok: true, text: `The Admiralty's carrack is yours - she waits at ${port.name}. See Holdings > Fleet.` };
+    return { ok: true, text: `The Admiralty's carrack is yours. It is waiting at ${port.name}. See Holdings > Fleet.` };
   }
 
   /**
-   * THE HARBOURMASTER'S TAB (ui/navalYardWindow.js): the port, the captain's rank with its crown, today's board, the
+   * THE HARBOURMASTER'S TAB (ui/naval/navalYardWindow.js): the port, the captain's rank with its crown, today's board, the
    * contracts held, and the letters - each press its `{ ok, text }`.
    * @param {any} boat - the boat at the helm, lying to the quay (a delivery's hold)
    */
@@ -141,22 +180,25 @@ export function createHarbourOffice(deps) {
   const roomFor = (room, kg) => (room && Number.isFinite(room.stops) && Number.isFinite(room.load) ? Math.max(0, Math.floor((room.stops - room.load - 1e-6) / Math.max(1e-6, kg))) : Infinity);
   /** `n` of a good bought into `hold` - as many as the exchange sells today, the purse pays for and her room takes. */
   function buyGood(port, day, hold, id, n, room = null) {
-    if (!hold) return { ok: false, text: 'Goods go in a ship\'s hold - deal at the exchange from her helm.' };
-    const r = exchangeOf(port, day, L.dealtAt(port.key, day)).find((x) => x.id === id);
+    if (!hold) return { ok: false, text: 'Goods go in a ship\'s hold. Trade at the exchange from the helm.' };
+    const r = exchangeOf(port, day, L.dealtAt(port.key, day), L.stats?.().trade, townAt(port)).find((x) => x.id === id);
     if (!r || r.sells <= 0) return { ok: false, text: r?.exotic ? `${r.name} is not sold here.` : `The exchange sells no more ${goodById(id)?.name ?? 'of that'} today.` };
     const fit = roomFor(room?.(), r.kg);
-    if (fit <= 0) return { ok: false, text: 'She can carry no more - laden deeper, she would lie dead in the water.' };
+    if (fit <= 0) return { ok: false, text: 'The ship can\'t carry any more.' };
     const k = Math.min(asked(n), r.sells, Math.floor((deps.gold?.() ?? 0) / r.sell), fit);
     if (k <= 0) return { ok: false, text: `Not enough gold - ${gold(r.sell)} a ${r.unit}.` };
     deps.pay?.(k * r.sell);
-    deps.stow?.(hold, mintGood(id, k));
+    const goods = mintGood(id, k);
+    markCounterBought([goods], { price: k * r.sell });   // SEA-TRADE: online, what it cost rides it (before a stack's merge takes it)
+    deps.stow?.(hold, goods);
     L.deal(port.key, day, id, k, 'bought');
+    deps.town?.seaDeal?.(port);   // SEA-TRADE: a dealing at the port's exchange
     return { ok: true, text: `Bought ${units(r, k)} for ${gold(k * r.sell)}.` };
   }
   /** `n` of a good sold out of `hold` - as many as she carries and the exchange buys today. */
   function sellGood(port, day, hold, id, n) {
-    if (!hold) return { ok: false, text: 'Goods are sold out of a ship\'s hold - deal at the exchange from her helm.' };
-    const r = exchangeOf(port, day, L.dealtAt(port.key, day)).find((x) => x.id === id);
+    if (!hold) return { ok: false, text: 'Goods are sold from a ship\'s hold. Trade at the exchange from the helm.' };
+    const r = exchangeOf(port, day, L.dealtAt(port.key, day), L.stats?.().trade, townAt(port)).find((x) => x.id === id);
     const have = goodIn(hold, id);
     if (!r || have <= 0) return { ok: false, text: `You carry no ${goodById(id)?.name ?? 'such goods'}.` };
     if (r.buys <= 0) return { ok: false, text: `The exchange will take no more ${r.name} today.` };
@@ -164,10 +206,11 @@ export function createHarbourOffice(deps) {
     deps.credit?.(k * r.buy);
     L.deal(port.key, day, id, k, 'sold');
     L.note('traded', k * r.buy);
+    deps.town?.seaDeal?.(port);   // SEA-TRADE: a dealing at the port's exchange
     return { ok: true, text: `Sold ${units(r, k)} for ${gold(k * r.buy)}.` };
   }
   /**
-   * THE EXCHANGE'S TAB (ui/navalYardWindow.js): the port's goods at today's prices, what the boat at the quay carries
+   * THE EXCHANGE'S TAB (ui/naval/navalYardWindow.js): the port's goods at today's prices, what the boat at the quay carries
    * of each, her goods' weight and her room (AUDIT CAPTAIN'S SEA B11: the kg more she carries before she lies dead in the
    * water - she was sold to a standstill unsaid) - and the presses. The other sea's goods only where the captain may
    * sail for them (`deps.etherGoods`) or carries some (AUDIT CAPTAIN'S SEA B16).
@@ -178,10 +221,11 @@ export function createHarbourOffice(deps) {
     if (!port) return null;
     const day = deps.day?.() ?? 0, hold = boat?.cargo ?? null, room = typeof boat?.room === 'function' ? boat.room : null;
     const others = deps.etherGoods?.() !== false;
-    const rows = exchangeOf(port, day, L.dealtAt(port.key, day)).map((r) => ({ ...r, have: goodIn(hold, r.id) })).filter((r) => others || !r.exotic || r.have > 0);
+    const rows = exchangeOf(port, day, L.dealtAt(port.key, day), L.stats?.().trade, townAt(port)).map((r) => ({ ...r, have: goodIn(hold, r.id) })).filter((r) => others || !r.exotic || r.have > 0);
     const rm = room?.();
     return {
       port: port.name, ether: !!port.ether, gold: deps.gold?.() ?? 0, weight: hold ? goodsWeight(hold) : null, rows,
+      band: deps.town?.bandAt?.(port) ?? null,   // SEA-TRADE: the port town's economy, said in the tab's lede
       room: rm && Number.isFinite(rm.stops) && Number.isFinite(rm.load) ? Math.max(0, Math.floor(rm.stops - rm.load)) : null,
       buy: (id, n) => buyGood(port, day, hold, id, n, room), sell: (id, n) => sellGood(port, day, hold, id, n),
     };
@@ -196,10 +240,10 @@ export function createHarbourOffice(deps) {
   /** A chart read: its cache marked on the captain's charts. Answers `{ ok, text }` - ok, and the chart is spent. */
   function readChart(item) {
     const site = chartSite(item?.message ?? 0, deps.ports?.() ?? [], deps.seaAt ?? (() => false));
-    if (!site) return { ok: false, text: 'The chart\'s ink has run - no coast on it you know.' };
+    if (!site) return { ok: false, text: 'The chart\'s ink has run. You know no coast on it.' };
     if (L.charts().some((c) => c.id === site.id)) return { ok: true, text: `You have marked this cache already: ${site.words}.` };
-    if (L.wasRaised?.(site.id)) return { ok: true, text: `This cache was raised long since - the chart is worth no more than its parchment.` };   // AUDIT CAPTAIN'S SEA B8: the same chart, read again, paid again
-    if (!L.markChart(site)) return { ok: false, text: 'Your charts are crowded with marks - raise a cache first.' };
+    if (L.wasRaised?.(site.id)) return { ok: true, text: `This cache was raised long ago. The chart is worth no more than its parchment.` };   // AUDIT CAPTAIN'S SEA B8: the same chart, read again, paid again
+    if (!L.markChart(site)) return { ok: false, text: 'Your charts are full of marks. Raise a cache first.' };
     return { ok: true, text: `You mark the chart's cache on your own charts: ${site.words}. Sail there and your lookout will find it.` };
   }
   /** A cache raised (its site's id): off the charts, its gold paid. Answers the gold, or 0 for none. */

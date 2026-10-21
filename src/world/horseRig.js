@@ -1,13 +1,13 @@
 // @ts-check
 // COATS3D (bible/06-Systems/Horse-Coats.md, "The 3D horse"): THE 3D HORSE, ITS GL HALF - one per renderer
 // (`horseRigFor`), shared by every horse the Morrowind lane draws: the player's own under them (player/mwView.js),
-// every other rider's (net/peerBodies.js), and Horse Cart and Cargo's standing, following and pulling horses and the
+// every other rider's (net/peer/peerBodies.js), and Horse Cart and Cargo's standing, following and pulling horses and the
 // road's teams (scenes/horseCartPool.js).
 //
 //  - ONE STREAM. The bake (world/horseModel.js horseSkinStream) is uploaded once; every horse is a view of it with its
 //    OWN palette (renderer.createSkinPalette - a picture queued in a sprite batch is drawn at the flush, so each horse
 //    keeps the pose it was queued in) and its own gait.
-//  - ONE PICTURE A LOOK. The body's picture is dyed per look (systems/horseCoats.js dyeHorseTexelRows, the sprites'
+//  - ONE PICTURE A LOOK. The body's picture is dyed per look (systems/horse/horseCoats.js dyeHorseTexelRows, the sprites'
 //    law on the horse's own surface - world/horseModel.js startTexelMap, built once a slice a frame), DYE_ROWS a frame
 //    so no frame pays a look's whole 50-120 ms, and uploaded with its mips once done; a horse whose look is not up yet wears the bay's. Past
 //    HORSE3D_LOOKS_KEPT looks, the one longest undrawn is let go - never one drawn this frame or the last, so a crowd of
@@ -21,7 +21,7 @@
 //
 // Not a DFU member: Daggerfall's horse is a sprite. Ledger A (COATS3D).
 import { HORSE_MODEL_URL, HORSE_PICTURE_URLS, horseSkinStream, horsePaletteShape, horsePoseScratch, horseGait, stepHorseGait, writeHorsePalette, startTexelMap, rgbaMips, horseHide } from './horseModel.js';
-import { dyeHorseTexelRows, horseLookCode, horseLookOfCode } from '../systems/horseCoats.js';
+import { dyeHorseTexelRows, horseLookCode, horseLookOfCode } from '../systems/horse/horseCoats.js';
 import { drawRigSpriteBox } from '../render/characterSprite.js';
 import { MW_ARM_PIXEL, CHAR_SPRITE_RT_SIZE } from '../render/renderer.js';
 import { decodePng } from '../systems/textureReplacement.js';
@@ -159,9 +159,10 @@ export function createHorseRig({ renderer, fetchJson = (u) => fetch(u).then((r) 
 
   /** One frame of a horse: its gait stepped at `speed` (m/s, its ground speed), its pose written and uploaded, and
    *  where it stands - its feet (the rig's origin on the ground) and its heading (the way it faces, the motor's yaw:
-   *  0 down +Z, as every body's). */
-  function step(h, { feet, yaw, speed = 0, dt = 0, look = 0 }) {
-    stepHorseGait(h.gait, bake, speed, dt, h.seed);
+   *  0 down +Z, as every body's). `gallops` false: its rider holds it to a slow ride (HORSE-WALK - horseModel.js
+   *  gaitFor); a horse no one rides gallops as its speed says. */
+  function step(h, { feet, yaw, speed = 0, dt = 0, look = 0, gallops = true }) {
+    stepHorseGait(h.gait, bake, speed, dt, h.seed, gallops);
     writeHorsePalette(bake, h.gait, h.pal, h.scratch);
     renderer.updateSkinPalette(h.mesh, h.pal);
     h.look = horseLookCode(horseLookOfCode(look | 0));
